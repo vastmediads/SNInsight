@@ -1,0 +1,28 @@
+# 构建产物
+dist/
+sninsight
+*.o
+
+# eBPF 生成文件
+internal/capture/traffic_*.go
+bpf/*.o
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 日志
+*.log
+
+# 测试
+coverage.out
+coverage.html
+
+# macOS
+.DS_Store
+
+# 依赖
+vendor/

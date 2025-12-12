@@ -1,0 +1,53 @@
+# Sninsight 配置示例
+# 复制此文件到 ~/.config/sninsight/config.yaml 或 /etc/sninsight/config.yaml
+
+# 网卡列表 (留空表示所有非回环网卡)
+interfaces:
+  # - eth0
+  # - ens192
+
+# 过滤配置
+filter:
+  # BPF 过滤表达式 (可选)
+  bpf: ""
+
+  # 域名白名单 (支持通配符 *.example.com)
+  # 如果设置，只显示匹配的域名
+  include_domains:
+    # - "*.google.com"
+    # - "github.com"
+
+  # 域名黑名单 (支持通配符)
+  # 匹配的域名将被过滤
+  exclude_domains:
+    # - "*.doubleclick.net"
+    # - "*.ads.*"
+
+# 显示配置
+display:
+  # 刷新间隔 (支持: 500ms, 1s, 2s 等)
+  refresh: 1s
+  # 最大显示行数
+  max_rows: 50
+
+# 日志配置
+logging:
+  # 日志级别: debug, info, warn, error
+  level: warn
+  # 日志文件路径 (留空禁用文件日志)
+  file: /var/log/sninsight/sninsight.log
+  # 单文件最大 MB
+  max_size_mb: 10
+  # 保留文件数
+  max_files: 3
+
+# 输出配置
+output:
+  # 运行时长后退出 (0 表示持续运行, 支持: 30s, 5m, 1h 等)
+  duration: 0
+  # 导出文件路径 (留空禁用导出)
+  file: ""
+  # 导出格式: json, csv
+  format: json
+  # 禁用 TUI (后台模式)
+  no_tui: false
