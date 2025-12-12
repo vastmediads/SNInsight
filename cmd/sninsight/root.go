@@ -1,16 +1,26 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
+	"github.com/nickproject/sninsight/internal/aggregator"
+	"github.com/nickproject/sninsight/internal/capture"
 	"github.com/nickproject/sninsight/internal/config"
+	"github.com/nickproject/sninsight/internal/export"
+	"github.com/nickproject/sninsight/internal/filter"
+	"github.com/nickproject/sninsight/internal/logger"
+	"github.com/nickproject/sninsight/internal/tui"
 )
 
 var (
@@ -70,7 +80,6 @@ func initConfig() {
 	if cfgFile != "" {
 		viper.SetConfigFile(cfgFile)
 	} else {
-		// 搜索配置文件
 		home, err := os.UserHomeDir()
 		if err == nil {
 			viper.AddConfigPath(home + "/.config/sninsight")
@@ -81,12 +90,10 @@ func initConfig() {
 		viper.SetConfigType("yaml")
 	}
 
-	// 环境变量
 	viper.SetEnvPrefix("SNINSIGHT")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
 
-	// 读取配置文件
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
 			fmt.Fprintf(os.Stderr, "读取配置文件错误: %v\n", err)
@@ -94,7 +101,6 @@ func initConfig() {
 		}
 	}
 
-	// 解析到结构体
 	if err := viper.Unmarshal(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "解析配置错误: %v\n", err)
 		os.Exit(1)
@@ -102,34 +108,198 @@ func initConfig() {
 }
 
 func runMonitor(cmd *cobra.Command, args []string) error {
+	// 初始化日志
+	logCfg := logger.Config{
+		Level:     cfg.Logging.Level,
+		File:      cfg.Logging.File,
+		MaxSizeMB: cfg.Logging.MaxSizeMB,
+		MaxFiles:  cfg.Logging.MaxFiles,
+		ToStderr:  cfg.Output.NoTUI,
+	}
+	if err := logger.Init(logCfg); err != nil {
+		return fmt.Errorf("初始化日志失败: %w", err)
+	}
+	defer logger.Sync()
+
 	// 权限检查
 	if err := checkPermissions(); err != nil {
 		return err
 	}
 
-	// TODO: 启动监控 (将在 Task 12 实现)
-	fmt.Printf("Sninsight v0.1.0 (%s/%s)\n", runtime.GOOS, runtime.GOARCH)
-	fmt.Printf("配置: %+v\n", cfg)
+	// 创建 context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	return fmt.Errorf("监控功能尚未完全实现")
+	// 处理信号
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		logger.Info("收到退出信号")
+		cancel()
+	}()
+
+	// 如果设置了 duration，添加超时
+	if cfg.Output.Duration > 0 {
+		var timeoutCancel context.CancelFunc
+		ctx, timeoutCancel = context.WithTimeout(ctx, cfg.Output.Duration)
+		defer timeoutCancel()
+	}
+
+	// 创建抓包器
+	captureCfg := capture.CaptureConfig{
+		Interfaces: cfg.Interfaces,
+		BPFFilter:  cfg.Filter.BPF,
+	}
+	capturer, err := capture.New(captureCfg)
+	if err != nil {
+		return fmt.Errorf("创建抓包器失败: %w", err)
+	}
+
+	// 创建过滤器
+	domainFilter := filter.New(cfg.Filter.IncludeDomains, cfg.Filter.ExcludeDomains)
+
+	// 创建聚合器
+	caps := capturer.Capabilities()
+	agg := aggregator.NewAggregator(domainFilter, caps.SupportsDirection, cfg.Display.Refresh)
+
+	// 创建输出通道
+	entriesChan := make(chan []aggregator.TrafficEntry, 10)
+
+	// 启动抓包
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := capturer.Start(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("抓包错误", "error", err)
+		}
+	}()
+
+	// 启动聚合器
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		agg.Run(ctx, capturer.Events(), capturer.Stats(), entriesChan)
+	}()
+
+	// 获取系统信息
+	hostname, _ := os.Hostname()
+	ifaces, _ := capture.DiscoverInterfaces(cfg.Interfaces)
+
+	startTime := time.Now()
+	var lastEntries []aggregator.TrafficEntry
+	var entriesMu sync.Mutex
+
+	// 运行 TUI 或等待导出
+	if cfg.Output.NoTUI {
+		// 非 TUI 模式：收集数据直到超时或退出
+		for {
+			select {
+			case <-ctx.Done():
+				goto exportData
+			case entries, ok := <-entriesChan:
+				if !ok {
+					goto exportData
+				}
+				entriesMu.Lock()
+				lastEntries = entries
+				entriesMu.Unlock()
+			}
+		}
+	} else {
+		// TUI 模式
+		tuiCfg := tui.Config{
+			SupportsDirection: caps.SupportsDirection,
+			Hostname:          hostname,
+			KernelVersion:     getKernelVersion(),
+			Interfaces:        ifaces,
+		}
+
+		// 在后台收集最后的数据用于导出
+		go func() {
+			for entries := range entriesChan {
+				entriesMu.Lock()
+				lastEntries = entries
+				entriesMu.Unlock()
+			}
+		}()
+
+		if err := tui.Run(tuiCfg, entriesChan); err != nil {
+			cancel()
+			return fmt.Errorf("TUI 错误: %w", err)
+		}
+		cancel()
+	}
+
+exportData:
+	// 停止抓包
+	capturer.Stop()
+	wg.Wait()
+
+	// 导出数据
+	entriesMu.Lock()
+	defer entriesMu.Unlock()
+
+	if cfg.Output.File != "" && len(lastEntries) > 0 {
+		format, err := export.ParseFormat(cfg.Output.Format)
+		if err != nil {
+			return err
+		}
+
+		var totalIn, totalOut uint64
+		for _, e := range lastEntries {
+			totalIn += e.TotalIn
+			totalOut += e.TotalOut
+		}
+
+		report := &export.Report{
+			Timestamp:   time.Now(),
+			Duration:    time.Since(startTime),
+			TotalIn:     totalIn,
+			TotalOut:    totalOut,
+			Connections: len(lastEntries),
+			Entries:     lastEntries,
+		}
+
+		if err := export.Export(report, cfg.Output.File, format); err != nil {
+			return fmt.Errorf("导出失败: %w", err)
+		}
+		logger.Info("数据已导出", "file", cfg.Output.File)
+	}
+
+	return nil
 }
 
 func checkPermissions() error {
 	if runtime.GOOS == "linux" {
-		// Linux: 检查 root 或 CAP_NET_ADMIN
 		if os.Geteuid() != 0 {
 			return fmt.Errorf("需要 root 权限或 CAP_NET_ADMIN 能力")
 		}
 	} else if runtime.GOOS == "darwin" {
-		// macOS: 检查 root 或 BPF 访问权限
 		if os.Geteuid() != 0 {
-			// 检查 /dev/bpf* 是否可访问
 			if _, err := os.Stat("/dev/bpf0"); os.IsPermission(err) {
 				return fmt.Errorf("需要 sudo 权限或加入 access_bpf 组")
 			}
 		}
 	}
 	return nil
+}
+
+func getKernelVersion() string {
+	if runtime.GOOS == "darwin" {
+		return "macOS"
+	}
+	// Linux: 读取 /proc/version
+	data, err := os.ReadFile("/proc/version")
+	if err != nil {
+		return "unknown"
+	}
+	parts := strings.Fields(string(data))
+	if len(parts) >= 3 {
+		return parts[2]
+	}
+	return "unknown"
 }
 
 func Execute() error {
