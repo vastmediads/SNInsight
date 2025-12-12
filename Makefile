@@ -1,4 +1,4 @@
-.PHONY: all build build-linux build-darwin bpf generate clean deps run
+.PHONY: all build build-all build-linux build-darwin bpf generate clean deps run
 
 VERSION := 0.1.0
 LDFLAGS := -ldflags "-s -w -X main.Version=$(VERSION)"
@@ -9,21 +9,36 @@ all: build
 build:
 	go build $(LDFLAGS) -o dist/sninsight ./cmd/sninsight
 
-# 构建 Linux (需要在 Linux 上或交叉编译)
+# 一次性构建 Linux x86_64 + macOS ARM64
+build-all: build-linux build-darwin
+	@echo "构建完成:"
+	@ls -lh dist/sninsight-*
+
+# 构建 Linux x86_64 (纯 Go，使用 eBPF)
 build-linux:
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o dist/sninsight-linux-amd64 ./cmd/sninsight
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o dist/sninsight-linux-amd64 ./cmd/sninsight
 
 # 构建 Linux ARM64
 build-linux-arm64:
-	CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/sninsight-linux-arm64 ./cmd/sninsight
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/sninsight-linux-arm64 ./cmd/sninsight
 
-# 构建 macOS ARM
+# 构建 macOS ARM64 (需要 CGO 支持 libpcap，必须在 macOS 上编译)
 build-darwin:
+ifeq ($(shell uname -s),Darwin)
 	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o dist/sninsight-darwin-arm64 ./cmd/sninsight
+else
+	@echo "警告: macOS 版本需要在 macOS 上编译 (需要 libpcap)"
+	@echo "跳过 darwin 构建"
+endif
 
-# 构建 macOS Intel
+# 构建 macOS Intel (需要在 macOS 上编译)
 build-darwin-amd64:
+ifeq ($(shell uname -s),Darwin)
 	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o dist/sninsight-darwin-amd64 ./cmd/sninsight
+else
+	@echo "警告: macOS 版本需要在 macOS 上编译 (需要 libpcap)"
+	@echo "跳过 darwin-amd64 构建"
+endif
 
 # 编译 eBPF 程序 (需要 clang 和 vmlinux.h)
 bpf:
@@ -74,6 +89,7 @@ help:
 	@echo ""
 	@echo "使用方法:"
 	@echo "  make build          - 构建当前平台"
+	@echo "  make build-all      - 一次性构建 Linux x86_64 + macOS ARM64"
 	@echo "  make build-linux    - 构建 Linux amd64"
 	@echo "  make build-darwin   - 构建 macOS arm64"
 	@echo "  make bpf            - 编译 eBPF 程序"

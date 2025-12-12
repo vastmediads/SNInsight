@@ -233,18 +233,51 @@ func (m Model) renderHeader() string {
 func (m Model) renderTable() string {
 	var b strings.Builder
 
+	// 定义列宽
+	const (
+		colDomain = 32
+		colProto  = 5
+		colRate   = 12
+		colTotal  = 10
+		colConns  = 6
+	)
+
+	// 排序指示器
+	const sortIndicator = "▼"
+
+	// 生成表头，对当前排序列高亮显示
+	formatHeader := func(name string, width int, isSorted bool) string {
+		if isSorted {
+			// 先填充到指定宽度（减去排序指示器的宽度），再应用样式
+			text := PadRight(name+sortIndicator, width)
+			return sortColumnStyle.Render(text)
+		}
+		return PadRight(name, width)
+	}
+
 	// 表头
 	var header string
 	if m.config.SupportsDirection {
-		header = fmt.Sprintf(" %-30s %5s %12s %12s %10s %6s",
-			"Domain/IP", "Proto", "In Rate", "Out Rate", "Total", "Conns")
+		header = fmt.Sprintf(" %-*s %-*s %s %s %s %s",
+			colDomain, "Domain/IP",
+			colProto, "Proto",
+			formatHeader("In Rate", colRate, m.sortMode == aggregator.SortByInRate),
+			formatHeader("Out Rate", colRate, m.sortMode == aggregator.SortByOutRate),
+			formatHeader("Total", colTotal, m.sortMode == aggregator.SortByTotal),
+			formatHeader("Conns", colConns, m.sortMode == aggregator.SortByConns))
 	} else {
-		header = fmt.Sprintf(" %-30s %5s %12s %10s %6s",
-			"Domain/IP", "Proto", "Rate", "Total", "Conns")
+		// 非方向模式下，InRate 和 OutRate 合并为 Rate
+		isRateSorted := m.sortMode == aggregator.SortByInRate || m.sortMode == aggregator.SortByOutRate
+		header = fmt.Sprintf(" %-*s %-*s %s %s %s",
+			colDomain, "Domain/IP",
+			colProto, "Proto",
+			formatHeader("Rate", colRate, isRateSorted),
+			formatHeader("Total", colTotal, m.sortMode == aggregator.SortByTotal),
+			formatHeader("Conns", colConns, m.sortMode == aggregator.SortByConns))
 	}
 	b.WriteString(tableHeaderStyle.Render(header))
 	b.WriteString("\n")
-	b.WriteString(strings.Repeat("-", m.width))
+	b.WriteString(strings.Repeat("─", m.width))
 	b.WriteString("\n")
 
 	// 计算可显示行数
@@ -259,23 +292,34 @@ func (m Model) renderTable() string {
 			break
 		}
 
-		name := TruncateString(entry.DisplayName, 30)
+		name := TruncateString(entry.DisplayName, colDomain)
+
+		// 先格式化速率字符串（不带颜色）
+		inRateStr := FormatRate(entry.InRate)
+		outRateStr := FormatRate(entry.OutRate)
+		totalStr := FormatBytes(entry.Total())
+
+		// 使用固定宽度填充后再上色
+		inRatePadded := PadRight(inRateStr, colRate)
+		outRatePadded := PadRight(outRateStr, colRate)
+
 		var row string
 		if m.config.SupportsDirection {
-			row = fmt.Sprintf(" %-30s %5s %12s %12s %10s %6d",
-				name,
-				entry.Protocol,
-				inRateStyle.Render(FormatRate(entry.InRate)),
-				outRateStyle.Render(FormatRate(entry.OutRate)),
-				FormatBytes(entry.Total()),
-				entry.ConnCount)
+			row = fmt.Sprintf(" %-*s %-*s %s %s %-*s %*d",
+				colDomain, name,
+				colProto, entry.Protocol,
+				inRateStyle.Render(inRatePadded),
+				outRateStyle.Render(outRatePadded),
+				colTotal, totalStr,
+				colConns, entry.ConnCount)
 		} else {
-			row = fmt.Sprintf(" %-30s %5s %12s %10s %6d",
-				name,
-				entry.Protocol,
-				FormatRate(entry.InRate+entry.OutRate),
-				FormatBytes(entry.Total()),
-				entry.ConnCount)
+			combinedRate := FormatRate(entry.InRate + entry.OutRate)
+			row = fmt.Sprintf(" %-*s %-*s %-*s %-*s %*d",
+				colDomain, name,
+				colProto, entry.Protocol,
+				colRate, combinedRate,
+				colTotal, totalStr,
+				colConns, entry.ConnCount)
 		}
 
 		if i == m.selected {

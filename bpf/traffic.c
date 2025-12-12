@@ -59,19 +59,20 @@ struct {
     __uint(max_entries, 256 * 1024);
 } tls_events SEC(".maps");
 
-// 检查是否为 TLS ClientHello
-static __always_inline int is_tls_client_hello(void *data, void *data_end, __u32 offset) {
-    if (data + offset + 6 > data_end)
+// 检查是否为 TLS ClientHello (使用 bpf_skb_load_bytes 安全读取)
+static __always_inline int is_tls_client_hello(struct __sk_buff *skb, __u32 offset) {
+    __u8 header[6];
+
+    // 使用 bpf_skb_load_bytes 安全读取前 6 字节
+    if (bpf_skb_load_bytes(skb, offset, header, 6) < 0)
         return 0;
 
-    __u8 *payload = data + offset;
-
     // Content Type: Handshake (0x16)
-    if (payload[0] != 0x16)
+    if (header[0] != 0x16)
         return 0;
 
     // Handshake Type: ClientHello (0x01)
-    if (payload[5] != 0x01)
+    if (header[5] != 0x01)
         return 0;
 
     return 1;
@@ -118,7 +119,7 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, __u8 direction) {
         return TC_ACT_OK;
 
     __u32 ip_hdr_len = ip->ihl * 4;
-    if (ip_hdr_len < sizeof(struct iphdr))
+    if (ip_hdr_len < sizeof(struct iphdr) || ip_hdr_len > 60)
         return TC_ACT_OK;
 
     // 构建 flow key
@@ -129,25 +130,27 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, __u8 direction) {
         .direction = direction,
     };
 
-    __u32 payload_offset = sizeof(*eth) + ip_hdr_len;
-
     if (ip->protocol == IPPROTO_TCP) {
-        // 解析 TCP 头
-        struct tcphdr *tcp = (void *)ip + ip_hdr_len;
-        if ((void *)(tcp + 1) > data_end)
+        // 解析 TCP 头 - 使用显式边界检查
+        void *tcp_start = (void *)eth + sizeof(*eth) + ip_hdr_len;
+        struct tcphdr *tcp = tcp_start;
+        if (tcp_start + sizeof(struct tcphdr) > data_end)
             return TC_ACT_OK;
 
         key.src_port = bpf_ntohs(tcp->source);
         key.dst_port = bpf_ntohs(tcp->dest);
 
         __u32 tcp_hdr_len = tcp->doff * 4;
-        payload_offset += tcp_hdr_len;
+        if (tcp_hdr_len < sizeof(struct tcphdr) || tcp_hdr_len > 60)
+            return TC_ACT_OK;
+
+        __u32 payload_offset = sizeof(*eth) + ip_hdr_len + tcp_hdr_len;
 
         // 更新统计
         update_flow_stats(&key, skb->len);
 
-        // 检查 TLS ClientHello
-        if (is_tls_client_hello(data, data_end, payload_offset)) {
+        // 检查 TLS ClientHello (只在 egress 方向检测，因为 ClientHello 由客户端发出)
+        if (direction == 1 && is_tls_client_hello(skb, payload_offset)) {
             struct tls_event *evt = bpf_ringbuf_reserve(&tls_events, sizeof(*evt), 0);
             if (evt) {
                 evt->timestamp_ns = bpf_ktime_get_ns();
@@ -158,24 +161,29 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, __u8 direction) {
                 evt->proto = ip->protocol;
                 evt->direction = direction;
 
-                // 计算 payload 长度
-                __u32 payload_len = data_end - (data + payload_offset);
-                if (payload_len > 256)
-                    payload_len = 256;
+                // 使用 skb->len 计算 payload 长度
+                __u32 total_hdr_len = payload_offset;
+                __u16 payload_len = 0;
+                if (skb->len > total_hdr_len) {
+                    __u32 available = skb->len - total_hdr_len;
+                    if (available > 256)
+                        available = 256;
+                    payload_len = (__u16)available;
+                }
                 evt->payload_len = payload_len;
 
-                // 复制 payload
-                if (payload_len > 0) {
-                    bpf_probe_read_kernel(evt->payload, payload_len, data + payload_offset);
-                }
+                // 使用固定大小读取，避免验证器报错
+                // 始终读取 256 字节，实际有效长度由 payload_len 指示
+                bpf_skb_load_bytes(skb, payload_offset, evt->payload, 256);
 
                 bpf_ringbuf_submit(evt, 0);
             }
         }
     } else if (ip->protocol == IPPROTO_UDP) {
-        // 解析 UDP 头
-        struct udphdr *udp = (void *)ip + ip_hdr_len;
-        if ((void *)(udp + 1) > data_end)
+        // 解析 UDP 头 - 使用显式边界检查
+        void *udp_start = (void *)eth + sizeof(*eth) + ip_hdr_len;
+        struct udphdr *udp = udp_start;
+        if (udp_start + sizeof(struct udphdr) > data_end)
             return TC_ACT_OK;
 
         key.src_port = bpf_ntohs(udp->source);

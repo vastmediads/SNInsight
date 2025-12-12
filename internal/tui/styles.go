@@ -8,6 +8,7 @@ var (
 	secondaryColor = lipgloss.Color("243") // 灰色
 	successColor   = lipgloss.Color("42")  // 绿色
 	warningColor   = lipgloss.Color("214") // 橙色
+	highlightColor = lipgloss.Color("226") // 黄色 (排序指示)
 
 	// 标题样式
 	titleStyle = lipgloss.NewStyle().
@@ -50,4 +51,13 @@ var (
 	// 速率样式 (出站)
 	outRateStyle = lipgloss.NewStyle().
 			Foreground(warningColor)
+
+	// 排序列高亮样式
+	sortColumnStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(highlightColor)
+
+	// 排序指示器样式
+	sortIndicatorStyle = lipgloss.NewStyle().
+				Foreground(highlightColor)
 )

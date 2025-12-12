@@ -1,6 +1,10 @@
 package tui
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+	"unicode/utf8"
+)
 
 // FormatBytes 格式化字节数为人类可读格式
 func FormatBytes(bytes uint64) string {
@@ -32,11 +36,30 @@ func FormatRate(bytesPerSec uint64) string {
 
 // TruncateString 截断字符串
 func TruncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	if utf8.RuneCountInString(s) <= maxLen {
 		return s
 	}
+	runes := []rune(s)
 	if maxLen <= 3 {
-		return s[:maxLen]
+		return string(runes[:maxLen])
 	}
-	return s[:maxLen-3] + "..."
+	return string(runes[:maxLen-3]) + "..."
+}
+
+// PadRight 右填充字符串到指定宽度
+func PadRight(s string, width int) string {
+	runeCount := utf8.RuneCountInString(s)
+	if runeCount >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-runeCount)
+}
+
+// PadLeft 左填充字符串到指定宽度
+func PadLeft(s string, width int) string {
+	runeCount := utf8.RuneCountInString(s)
+	if runeCount >= width {
+		return s
+	}
+	return strings.Repeat(" ", width-runeCount) + s
 }

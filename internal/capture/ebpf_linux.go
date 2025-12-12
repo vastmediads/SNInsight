@@ -14,6 +14,7 @@ import (
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"github.com/nickproject/sninsight/internal/diagnose"
 	"github.com/vishvananda/netlink"
 )
 
@@ -75,6 +76,9 @@ func (c *ebpfCapturer) Start(ctx context.Context) error {
 	// 加载 eBPF 程序
 	c.objs = &trafficObjects{}
 	if err := loadTrafficObjects(c.objs, nil); err != nil {
+		// 收集并输出诊断信息
+		report := diagnose.Collect(err)
+		diagnose.Output(report)
 		return fmt.Errorf("加载 eBPF 程序失败: %w", err)
 	}
 
@@ -257,6 +261,7 @@ func (c *ebpfCapturer) collectFlowStats() []FlowStats {
 	var stats []FlowStats
 	var key trafficFlowKey
 	var value trafficFlowValue
+	var keysToDelete []trafficFlowKey
 
 	iter := c.objs.FlowStats.Iterate()
 	for iter.Next(&key, &value) {
@@ -274,6 +279,14 @@ func (c *ebpfCapturer) collectFlowStats() []FlowStats {
 			LastSeenNs: value.LastSeenNs,
 		}
 		stats = append(stats, fs)
+		// 记录需要删除的 key，以便下次获取增量数据
+		keyCopy := key
+		keysToDelete = append(keysToDelete, keyCopy)
+	}
+
+	// 清空已读取的条目，使下次读取的是增量数据
+	for _, k := range keysToDelete {
+		c.objs.FlowStats.Delete(&k)
 	}
 
 	return stats

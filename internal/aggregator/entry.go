@@ -1,6 +1,7 @@
 package aggregator
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -31,17 +32,22 @@ func (e *TrafficEntry) Total() uint64 {
 type SessionMap struct {
 	mu       sync.RWMutex
 	sessions map[string]sessionEntry
+	// 按目标 IP:Port 索引的域名映射 (用于快速查找)
+	destIndex map[string]string
 }
 
 type sessionEntry struct {
 	domain   string
 	lastSeen time.Time
+	dstIP    string
+	dstPort  uint16
 }
 
 // NewSessionMap 创建会话映射
 func NewSessionMap() *SessionMap {
 	return &SessionMap{
-		sessions: make(map[string]sessionEntry),
+		sessions:  make(map[string]sessionEntry),
+		destIndex: make(map[string]string),
 	}
 }
 
@@ -53,6 +59,29 @@ func (m *SessionMap) Set(key, domain string) {
 		domain:   domain,
 		lastSeen: time.Now(),
 	}
+}
+
+// SetWithDest 设置映射并记录目标信息
+func (m *SessionMap) SetWithDest(key, domain, dstIP string, dstPort uint16) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessions[key] = sessionEntry{
+		domain:   domain,
+		lastSeen: time.Now(),
+		dstIP:    dstIP,
+		dstPort:  dstPort,
+	}
+	// 同时建立目标索引
+	destKey := fmt.Sprintf("%s:%d", dstIP, dstPort)
+	m.destIndex[destKey] = domain
+}
+
+// FindByDestination 根据目标 IP:Port 查找域名
+func (m *SessionMap) FindByDestination(dstIP string, dstPort uint16) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	destKey := fmt.Sprintf("%s:%d", dstIP, dstPort)
+	return m.destIndex[destKey]
 }
 
 // Get 获取域名

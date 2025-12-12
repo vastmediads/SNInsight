@@ -29,7 +29,6 @@ type Aggregator struct {
 	mu              sync.RWMutex
 	sessions        *SessionMap
 	currentStats    map[string]*flowAccumulator // 按域名/IP 聚合
-	prevStats       map[string]*flowAccumulator
 	filter          *filter.Filter
 	supportsDir     bool
 	refreshInterval time.Duration
@@ -42,6 +41,8 @@ type flowAccumulator struct {
 	protocol    string
 	bytesIn     uint64
 	bytesOut    uint64
+	rateIn      uint64              // 最新的入站瞬时速率
+	rateOut     uint64              // 最新的出站瞬时速率
 	connKeys    map[string]struct{} // 去重连接
 	lastSeen    time.Time
 }
@@ -51,7 +52,6 @@ func NewAggregator(f *filter.Filter, supportsDirection bool, refresh time.Durati
 	return &Aggregator{
 		sessions:        NewSessionMap(),
 		currentStats:    make(map[string]*flowAccumulator),
-		prevStats:       make(map[string]*flowAccumulator),
 		filter:          f,
 		supportsDir:     supportsDirection,
 		refreshInterval: refresh,
@@ -115,8 +115,9 @@ func (a *Aggregator) handleEvent(evt capture.PacketEvent) {
 	}
 
 	key := evt.ToFiveTuple().String()
-	a.sessions.Set(key, sni)
-	logger.Debug("记录 SNI 映射", "key", key, "sni", sni)
+	// 使用 SetWithDest 同时记录目标 IP:Port 索引
+	a.sessions.SetWithDest(key, sni, evt.DstIP.String(), evt.DstPort)
+	logger.Debug("记录 SNI 映射", "key", key, "sni", sni, "dstIP", evt.DstIP.String(), "dstPort", evt.DstPort)
 }
 
 // updateStats 更新流量统计
@@ -142,10 +143,14 @@ func (a *Aggregator) updateStats(flowStats []capture.FlowStats) {
 			a.currentStats[displayName] = acc
 		}
 
+		// fs.Bytes 现在是增量数据（每秒新增字节数）
+		// 同一域名的多个连接速率需要累加
 		if fs.Key.Direction == capture.Ingress || !a.supportsDir {
 			acc.bytesIn += fs.Bytes
+			acc.rateIn += fs.Bytes // 累加速率而不是覆盖
 		} else {
 			acc.bytesOut += fs.Bytes
+			acc.rateOut += fs.Bytes // 累加速率而不是覆盖
 		}
 		acc.connKeys[fs.Key.String()] = struct{}{}
 		acc.lastSeen = time.Now()
@@ -154,24 +159,52 @@ func (a *Aggregator) updateStats(flowStats []capture.FlowStats) {
 
 // resolveDisplayName 解析显示名称
 func (a *Aggregator) resolveDisplayName(key capture.FiveTuple) string {
-	// 先尝试从 session map 获取 SNI
+	// 确定远程服务器的 IP 和端口
+	var remoteIP string
+	var remotePort uint16
+
+	if key.Direction == capture.Egress {
+		// 出站流量：目标是远程服务器
+		remoteIP = key.DstIP
+		remotePort = key.DstPort
+	} else {
+		// 入站流量：源是远程服务器
+		remoteIP = key.SrcIP
+		remotePort = key.SrcPort
+	}
+
+	// 先尝试从 session map 获取 SNI (精确匹配)
 	if sni, ok := a.sessions.Get(key.String()); ok {
 		return sni
 	}
 
-	// 降级显示 IP:Port
-	var ip string
-	if key.Direction == capture.Egress {
-		ip = key.DstIP
-	} else {
-		ip = key.SrcIP
+	// 尝试反向查找 (ingress 流量对应的 egress SNI)
+	// TLS ClientHello 只在 egress 方向发送，所以需要反转查找
+	if key.Direction == capture.Ingress {
+		reverseKey := capture.FiveTuple{
+			SrcIP:     key.DstIP,
+			DstIP:     key.SrcIP,
+			SrcPort:   key.DstPort,
+			DstPort:   key.SrcPort,
+			Protocol:  key.Protocol,
+			Direction: capture.Egress,
+		}
+		if sni, ok := a.sessions.Get(reverseKey.String()); ok {
+			return sni
+		}
 	}
 
-	// 检查是否为有效 IP
-	if net.ParseIP(ip) != nil {
-		return fmt.Sprintf("%s:%d", ip, key.DstPort)
+	// 尝试只匹配远程服务器 IP:Port (不考虑本地源)
+	// 因为同一个服务器可能有多个连接
+	if sni := a.sessions.FindByDestination(remoteIP, remotePort); sni != "" {
+		return sni
 	}
-	return ip
+
+	// 降级显示远程 IP:Port
+	if net.ParseIP(remoteIP) != nil {
+		return fmt.Sprintf("%s:%d", remoteIP, remotePort)
+	}
+	return remoteIP
 }
 
 // computeRates 计算速率并返回条目列表
@@ -187,38 +220,17 @@ func (a *Aggregator) computeRates() []TrafficEntry {
 			Protocol:    curr.protocol,
 			TotalIn:     curr.bytesIn,
 			TotalOut:    curr.bytesOut,
+			InRate:      curr.rateIn,  // 直接使用实时速率
+			OutRate:     curr.rateOut, // 直接使用实时速率
 			ConnCount:   len(curr.connKeys),
 			LastSeen:    curr.lastSeen,
 		}
 
-		// 计算速率 (与上一周期差值)
-		if prev, ok := a.prevStats[name]; ok {
-			intervalSec := uint64(a.refreshInterval.Seconds())
-			if intervalSec == 0 {
-				intervalSec = 1
-			}
-			if curr.bytesIn >= prev.bytesIn {
-				entry.InRate = (curr.bytesIn - prev.bytesIn) / intervalSec
-			}
-			if curr.bytesOut >= prev.bytesOut {
-				entry.OutRate = (curr.bytesOut - prev.bytesOut) / intervalSec
-			}
-		}
-
 		entries = append(entries, entry)
-	}
 
-	// 保存当前状态用于下次计算
-	a.prevStats = make(map[string]*flowAccumulator, len(a.currentStats))
-	for k, v := range a.currentStats {
-		a.prevStats[k] = &flowAccumulator{
-			displayName: v.displayName,
-			protocol:    v.protocol,
-			bytesIn:     v.bytesIn,
-			bytesOut:    v.bytesOut,
-			connKeys:    v.connKeys,
-			lastSeen:    v.lastSeen,
-		}
+		// 重置瞬时速率，等待下一次更新
+		curr.rateIn = 0
+		curr.rateOut = 0
 	}
 
 	return entries
