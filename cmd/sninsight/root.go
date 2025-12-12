@@ -17,6 +17,7 @@ import (
 	"github.com/nickproject/sninsight/internal/aggregator"
 	"github.com/nickproject/sninsight/internal/capture"
 	"github.com/nickproject/sninsight/internal/config"
+	"github.com/nickproject/sninsight/internal/diagnose"
 	"github.com/nickproject/sninsight/internal/export"
 	"github.com/nickproject/sninsight/internal/filter"
 	"github.com/nickproject/sninsight/internal/logger"
@@ -24,8 +25,11 @@ import (
 )
 
 var (
-	cfgFile string
-	cfg     *config.Config
+	cfgFile        string
+	cfg            *config.Config
+	diagnoseEBPF   bool
+	diagnoseSNI    bool
+	testDomain     string
 )
 
 var rootCmd = &cobra.Command{
@@ -33,8 +37,12 @@ var rootCmd = &cobra.Command{
 	Short: "基于 eBPF 的网络流量监控工具",
 	Long: `Sninsight 是一个基于 eBPF 的网络流量监控工具。
 支持实时监控网络流量，解析 TLS SNI 识别域名，
-通过 TUI 界面实时展示流量统计。`,
-	RunE: runMonitor,
+通过 TUI 界面实时展示流量统计。
+
+诊断模式:
+  --diagnose-ebpf    检查 eBPF 运行环境（权限、内核配置等）
+  --diagnose-sni     检查 SNI 捕获功能（TLS 事件捕获、SNI 解析等）`,
+	RunE: runMain,
 }
 
 func init() {
@@ -59,6 +67,11 @@ func init() {
 	// 日志选项
 	rootCmd.Flags().String("log-file", "", "日志文件路径")
 	rootCmd.Flags().String("log-level", "warn", "日志级别 (debug|info|warn|error)")
+
+	// 诊断选项
+	rootCmd.Flags().BoolVar(&diagnoseEBPF, "diagnose-ebpf", false, "运行 eBPF 环境诊断")
+	rootCmd.Flags().BoolVar(&diagnoseSNI, "diagnose-sni", false, "运行 SNI 捕获诊断")
+	rootCmd.Flags().StringVar(&testDomain, "test-domain", "", "SNI 诊断使用的测试域名 (默认: cloudflare.com)")
 
 	// 绑定到 viper
 	viper.BindPFlag("interfaces", rootCmd.Flags().Lookup("interface"))
@@ -105,6 +118,40 @@ func initConfig() {
 		fmt.Fprintf(os.Stderr, "解析配置错误: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// runMain 主入口，根据参数决定运行模式
+func runMain(cmd *cobra.Command, args []string) error {
+	// 诊断模式
+	if diagnoseEBPF {
+		return runDiagnoseEBPF()
+	}
+	if diagnoseSNI {
+		return runDiagnoseSNI()
+	}
+
+	// 正常监控模式
+	return runMonitor(cmd, args)
+}
+
+// runDiagnoseEBPF 运行 eBPF 环境诊断
+func runDiagnoseEBPF() error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("eBPF 诊断仅支持 Linux 平台")
+	}
+
+	report := diagnose.RunEBPFDiagnose()
+	return report.OutputJSON()
+}
+
+// runDiagnoseSNI 运行 SNI 捕获诊断
+func runDiagnoseSNI() error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("SNI 诊断仅支持 Linux 平台")
+	}
+
+	report := diagnose.RunSNIDiagnose(testDomain)
+	return report.OutputJSON()
 }
 
 func runMonitor(cmd *cobra.Command, args []string) error {
