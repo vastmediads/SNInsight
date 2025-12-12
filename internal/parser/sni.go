@@ -21,6 +21,7 @@ const (
 )
 
 // ExtractSNI 从 TLS ClientHello payload 中提取 SNI
+// 支持处理被截断的 payload（例如 eBPF 只捕获 256 字节）
 func ExtractSNI(payload []byte) (string, error) {
 	if len(payload) < 6 {
 		return "", ErrPayloadTooShort
@@ -35,10 +36,8 @@ func ExtractSNI(payload []byte) (string, error) {
 	// payload[1:3] 是版本，我们不严格检查
 
 	// payload[3:5] 是记录长度
-	recordLen := binary.BigEndian.Uint16(payload[3:5])
-	if int(recordLen)+5 > len(payload) {
-		return "", ErrPayloadTooShort
-	}
+	// 注意: TLS ClientHello 通常超过 256 字节，但 eBPF 只能捕获有限数据
+	// 我们不检查 recordLen，尽量解析可用数据中的 SNI
 
 	// payload[5] 应该是 ClientHello (0x01)
 	if payload[5] != tlsClientHello {
@@ -52,7 +51,7 @@ func ExtractSNI(payload []byte) (string, error) {
 
 	// 跳过 ClientHello 头部，找到扩展部分
 	// 结构: HandshakeType(1) + Length(3) + Version(2) + Random(32) + SessionID(1+var) + CipherSuites(2+var) + Compression(1+var) + Extensions(2+var)
-	pos := 5 + 1 + 3 + 2 + 32 // 到达 SessionID 长度位置
+	pos := 5 + 1 + 3 + 2 + 32 // 到达 SessionID 长度位置 = 43
 
 	if pos >= len(payload) {
 		return "", ErrPayloadTooShort
@@ -86,11 +85,13 @@ func ExtractSNI(payload []byte) (string, error) {
 	extensionsLen := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
 	pos += 2
 
-	if pos+extensionsLen > len(payload) {
-		extensionsLen = len(payload) - pos // 截断情况，尽量解析
+	// 计算实际可用的扩展数据长度（处理截断情况）
+	availableLen := len(payload) - pos
+	if extensionsLen > availableLen {
+		extensionsLen = availableLen
 	}
 
-	// 遍历扩展找 SNI
+	// 遍历扩展找 SNI（SNI 通常是第一个扩展）
 	extEnd := pos + extensionsLen
 	for pos+4 <= extEnd {
 		extType := binary.BigEndian.Uint16(payload[pos : pos+2])
@@ -98,6 +99,10 @@ func ExtractSNI(payload []byte) (string, error) {
 		pos += 4
 
 		if pos+extLen > extEnd {
+			// 扩展数据被截断，如果是 SNI 扩展则尝试部分解析
+			if extType == extensionSNI {
+				return parseSNIExtension(payload[pos:extEnd])
+			}
 			break
 		}
 

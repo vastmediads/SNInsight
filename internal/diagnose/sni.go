@@ -217,6 +217,9 @@ func (d *SNIDiagnose) runCaptureTest() {
 	var capturedEvents []tlsEventData
 	var eventMu sync.Mutex
 	var sniFound string
+	var sniParseErr error
+	var sniParsePayloadLen uint16
+	var sniParseRawLen int
 
 	wg.Add(1)
 	go func() {
@@ -245,11 +248,17 @@ func (d *SNIDiagnose) runCaptureTest() {
 				eventMu.Lock()
 				capturedEvents = append(capturedEvents, *evt)
 
-				// 尝试解析 SNI
+				// 尝试解析 SNI，记录详细错误
 				if evt.PayloadLen > 0 {
 					payload := evt.Payload[:evt.PayloadLen]
-					if sni, err := parser.ExtractSNI(payload); err == nil && sni != "" {
+					sni, err := parser.ExtractSNI(payload)
+					if err == nil && sni != "" {
 						sniFound = sni
+					} else if sniParseErr == nil && err != nil {
+						// 记录第一个解析错误
+						sniParseErr = err
+						sniParsePayloadLen = evt.PayloadLen
+						sniParseRawLen = len(record.RawSample)
 					}
 				}
 				eventMu.Unlock()
@@ -282,6 +291,9 @@ func (d *SNIDiagnose) runCaptureTest() {
 	eventMu.Lock()
 	eventCount := len(capturedEvents)
 	foundSNI := sniFound
+	parseErr := sniParseErr
+	parsePayloadLen := sniParsePayloadLen
+	parseRawLen := sniParseRawLen
 	eventMu.Unlock()
 
 	// 检查 TLS 事件捕获
@@ -300,8 +312,15 @@ func (d *SNIDiagnose) runCaptureTest() {
 			fmt.Sprintf("成功解析 SNI: %s", foundSNI),
 			map[string]any{"sni": foundSNI})
 	} else if eventCount > 0 {
-		d.report.AddCheck("sni_parse", StatusFail,
-			"捕获到 TLS 事件但无法解析 SNI")
+		errMsg := "捕获到 TLS 事件但无法解析 SNI"
+		details := map[string]any{}
+		if parseErr != nil {
+			errMsg = fmt.Sprintf("SNI 解析失败: %v", parseErr)
+			details["error"] = parseErr.Error()
+			details["payload_len"] = parsePayloadLen
+			details["raw_sample_len"] = parseRawLen
+		}
+		d.report.AddCheckWithDetails("sni_parse", StatusFail, errMsg, details)
 	} else {
 		d.report.AddCheck("sni_parse", StatusSkipped, "无 TLS 事件，跳过 SNI 解析检查")
 	}
