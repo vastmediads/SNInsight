@@ -1,10 +1,8 @@
 # 构建产物
 dist/
 sninsight
-*.o
 
-# eBPF 生成文件
-internal/capture/traffic_*.go
+# eBPF 原始 C 编译产物（bpf/ 目录下的）
 bpf/*.o
 
 # IDE
