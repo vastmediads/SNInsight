@@ -31,6 +31,7 @@ type Aggregator struct {
 	currentStats    map[string]*flowAccumulator // 按域名/IP 聚合
 	filter          *filter.Filter
 	supportsDir     bool
+	sniOnly         bool // 仅统计有 SNI 域名的流量
 	refreshInterval time.Duration
 	cleanupInterval time.Duration
 	sessionTTL      time.Duration
@@ -48,12 +49,13 @@ type flowAccumulator struct {
 }
 
 // NewAggregator 创建聚合器
-func NewAggregator(f *filter.Filter, supportsDirection bool, refresh time.Duration) *Aggregator {
+func NewAggregator(f *filter.Filter, supportsDirection bool, sniOnly bool, refresh time.Duration) *Aggregator {
 	return &Aggregator{
 		sessions:        NewSessionMap(),
 		currentStats:    make(map[string]*flowAccumulator),
 		filter:          f,
 		supportsDir:     supportsDirection,
+		sniOnly:         sniOnly,
 		refreshInterval: refresh,
 		cleanupInterval: 30 * time.Second,
 		sessionTTL:      60 * time.Second,
@@ -126,7 +128,12 @@ func (a *Aggregator) updateStats(flowStats []capture.FlowStats) {
 	defer a.mu.Unlock()
 
 	for _, fs := range flowStats {
-		displayName := a.resolveDisplayName(fs.Key)
+		displayName, hasSNI := a.resolveDisplayNameWithSNI(fs.Key)
+
+		// sniOnly 模式：跳过没有 SNI 的流量
+		if a.sniOnly && !hasSNI {
+			continue
+		}
 
 		// 应用过滤器
 		if a.filter != nil && !a.filter.Match(displayName) {
@@ -157,8 +164,8 @@ func (a *Aggregator) updateStats(flowStats []capture.FlowStats) {
 	}
 }
 
-// resolveDisplayName 解析显示名称
-func (a *Aggregator) resolveDisplayName(key capture.FiveTuple) string {
+// resolveDisplayNameWithSNI 解析显示名称，同时返回是否成功解析到 SNI
+func (a *Aggregator) resolveDisplayNameWithSNI(key capture.FiveTuple) (string, bool) {
 	// 确定远程服务器的 IP 和端口
 	var remoteIP string
 	var remotePort uint16
@@ -175,7 +182,7 @@ func (a *Aggregator) resolveDisplayName(key capture.FiveTuple) string {
 
 	// 先尝试从 session map 获取 SNI (精确匹配)
 	if sni, ok := a.sessions.Get(key.String()); ok {
-		return sni
+		return sni, true
 	}
 
 	// 尝试反向查找 (ingress 流量对应的 egress SNI)
@@ -190,21 +197,21 @@ func (a *Aggregator) resolveDisplayName(key capture.FiveTuple) string {
 			Direction: capture.Egress,
 		}
 		if sni, ok := a.sessions.Get(reverseKey.String()); ok {
-			return sni
+			return sni, true
 		}
 	}
 
 	// 尝试只匹配远程服务器 IP:Port (不考虑本地源)
 	// 因为同一个服务器可能有多个连接
 	if sni := a.sessions.FindByDestination(remoteIP, remotePort); sni != "" {
-		return sni
+		return sni, true
 	}
 
-	// 降级显示远程 IP:Port
+	// 降级显示远程 IP:Port (无 SNI)
 	if net.ParseIP(remoteIP) != nil {
-		return fmt.Sprintf("%s:%d", remoteIP, remotePort)
+		return fmt.Sprintf("%s:%d", remoteIP, remotePort), false
 	}
-	return remoteIP
+	return remoteIP, false
 }
 
 // computeRates 计算速率并返回条目列表

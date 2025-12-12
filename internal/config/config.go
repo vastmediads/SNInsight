@@ -18,6 +18,7 @@ type FilterConfig struct {
 	BPF            string   `mapstructure:"bpf"`
 	IncludeDomains []string `mapstructure:"include_domains"`
 	ExcludeDomains []string `mapstructure:"exclude_domains"`
+	SNIOnly        bool     `mapstructure:"sni_only"`
 }
 
 // DisplayConfig 显示配置
@@ -50,6 +51,7 @@ func Default() *Config {
 			BPF:            "",
 			IncludeDomains: nil,
 			ExcludeDomains: nil,
+			SNIOnly:        false,
 		},
 		Display: DisplayConfig{
 			Refresh: time.Second,

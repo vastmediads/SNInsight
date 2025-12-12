@@ -54,9 +54,10 @@ func init() {
 	rootCmd.Flags().DurationP("refresh", "r", time.Second, "刷新间隔")
 
 	// 过滤选项
-	rootCmd.Flags().StringP("filter", "f", "", "BPF 过滤表达式")
+	rootCmd.Flags().StringP("filter", "f", "", "BPF 过滤表达式 (例: \"tcp port 443\")")
 	rootCmd.Flags().StringSlice("include-domains", nil, "域名白名单 (逗号分隔)")
 	rootCmd.Flags().StringSlice("exclude-domains", nil, "域名黑名单 (逗号分隔)")
+	rootCmd.Flags().Bool("sni-only", false, "仅统计能解析到 SNI 域名的流量")
 
 	// 输出选项
 	rootCmd.Flags().DurationP("duration", "d", 0, "运行时长后退出")
@@ -79,6 +80,7 @@ func init() {
 	viper.BindPFlag("filter.bpf", rootCmd.Flags().Lookup("filter"))
 	viper.BindPFlag("filter.include_domains", rootCmd.Flags().Lookup("include-domains"))
 	viper.BindPFlag("filter.exclude_domains", rootCmd.Flags().Lookup("exclude-domains"))
+	viper.BindPFlag("filter.sni_only", rootCmd.Flags().Lookup("sni-only"))
 	viper.BindPFlag("output.duration", rootCmd.Flags().Lookup("duration"))
 	viper.BindPFlag("output.file", rootCmd.Flags().Lookup("output"))
 	viper.BindPFlag("output.format", rootCmd.Flags().Lookup("format"))
@@ -208,7 +210,7 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 
 	// 创建聚合器
 	caps := capturer.Capabilities()
-	agg := aggregator.NewAggregator(domainFilter, caps.SupportsDirection, cfg.Display.Refresh)
+	agg := aggregator.NewAggregator(domainFilter, caps.SupportsDirection, cfg.Filter.SNIOnly, cfg.Display.Refresh)
 
 	// 创建输出通道
 	entriesChan := make(chan []aggregator.TrafficEntry, 10)
